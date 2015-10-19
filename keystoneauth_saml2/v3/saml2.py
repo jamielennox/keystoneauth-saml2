@@ -21,6 +21,62 @@ from keystoneauth_saml2.v3 import base
 LOG = logging.getLogger(__name__)
 
 
+def _first(_list):
+    if len(_list) != 1:
+        raise IndexError('Only single element list is acceptable')
+    return _list[0]
+
+
+class _Response(object):
+
+    ECP_SAML2_NAMESPACES = {
+        'ecp': 'urn:oasis:names:tc:SAML:2.0:profiles:SSO:ecp',
+        'S': 'http://schemas.xmlsoap.org/soap/envelope/',
+        'paos': 'urn:liberty:paos:2003-08'
+    }
+
+    def __init__(self, text):
+        self.data = etree.XML(text)
+
+    @property
+    def consumer_url(self):
+        u = self.data.xpath(self.URL_XP, namespaces=self.ECP_SAML2_NAMESPACES)
+        return _first(u) if u else None
+
+    def to_string(self):
+        return etree.tostring(self.data)
+
+
+class _SPResponse(_Response):
+
+    SAML2_HEADER_INDEX = 0
+
+    ECP_RELAY_STATE = '//ecp:RelayState'
+
+    URL_XP = '/S:Envelope/S:Header/paos:Request/@responseConsumerURL'
+
+    @property
+    def relay_state(self):
+        return _first(self.data.xpath(self.ECP_RELAY_STATE,
+                                      namespaces=self.ECP_SAML2_NAMESPACES))
+
+    def prepare(self):
+        self.data.remove(self.data[self.SAML2_HEADER_INDEX])
+
+
+class _IDPResponse(_Response):
+
+    URL_XP = '/S:Envelope/S:Header/ecp:Response/@AssertionConsumerServiceURL'
+
+    @property
+    def relay_state(self):
+        return self.data[0][0]
+
+    @relay_state.setter
+    def relay_state(self, value):
+        self.data[0][0] = value
+
+
 class Saml2Token(base._BaseSAMLPlugin):
     """Implement authentication plugin for SAML2 protocol.
 
@@ -68,7 +124,6 @@ class Saml2Token(base._BaseSAMLPlugin):
 
     _auth_method_class = base.Saml2TokenAuthMethod
 
-    SAML2_HEADER_INDEX = 0
     ECP_SP_EMPTY_REQUEST_HEADERS = {
         'Accept': 'text/html, application/vnd.paos+xml',
         'PAOS': ('ver="urn:liberty:paos:2003-08";"urn:oasis:names:tc:'
@@ -78,20 +133,6 @@ class Saml2Token(base._BaseSAMLPlugin):
     ECP_SP_SAML2_REQUEST_HEADERS = {
         'Content-Type': 'application/vnd.paos+xml'
     }
-
-    ECP_SAML2_NAMESPACES = {
-        'ecp': 'urn:oasis:names:tc:SAML:2.0:profiles:SSO:ecp',
-        'S': 'http://schemas.xmlsoap.org/soap/envelope/',
-        'paos': 'urn:liberty:paos:2003-08'
-    }
-
-    ECP_RELAY_STATE = '//ecp:RelayState'
-
-    ECP_SERVICE_PROVIDER_CONSUMER_URL = ('/S:Envelope/S:Header/paos:Request/'
-                                         '@responseConsumerURL')
-
-    ECP_IDP_CONSUMER_URL = ('/S:Envelope/S:Header/ecp:Response/'
-                            '@AssertionConsumerServiceURL')
 
     SOAP_FAULT = """
     <S:Envelope xmlns:S="http://schemas.xmlsoap.org/soap/envelope/">
@@ -106,39 +147,30 @@ class Saml2Token(base._BaseSAMLPlugin):
     </S:Envelope>
     """
 
-    def _handle_http_ecp_redirect(self, session, response, method, **kwargs):
-        if response.status_code not in (self.HTTP_MOVED_TEMPORARILY,
-                                        self.HTTP_SEE_OTHER):
-            return response
+    def _post_idp(self, session, sp_response):
+        """Present modified SAML2 authn assertion from the Service Provider."""
+        sp_response.prepare()
 
-        location = response.headers['location']
-        return session.request(location, method, authenticated=False,
-                               **kwargs)
+        # Currently HTTPBasicAuth method is hardcoded into the plugin
+        response = session.post(
+            self.identity_provider_url,
+            headers={'Content-type': 'text/xml'},
+            data=sp_response.to_string(),
+            requests_auth=(self.username, self.password),
+            authenticated=False,
+            log=False)
 
-    def _prepare_idp_saml2_request(self, saml2_authn_request):
-        header = saml2_authn_request[self.SAML2_HEADER_INDEX]
-        saml2_authn_request.remove(header)
+        idp_response = _IDPResponse(response.content)
 
-    def _check_consumer_urls(self, session, sp_response_consumer_url,
-                             idp_sp_response_consumer_url):
-        """Check if consumer URLs issued by SP and IdP are equal.
-
-        In the initial SAML2 authn Request issued by a Service Provider
-        there is a url called ``consumer url``. A trusted Identity Provider
-        should issue identical url. If the URLs are not equal the federated
-        authn process should be interrupted and the user should be warned.
-
-        :param session: session object to send out HTTP requests.
-        :type session: keystoneauth1.session.Session
-        :param sp_response_consumer_url: consumer URL issued by a SP
-        :type  sp_response_consumer_url: string
-        :param idp_sp_response_consumer_url: consumer URL issued by an IdP
-        :type idp_sp_response_consumer_url: string
-
-        """
-        if sp_response_consumer_url != idp_sp_response_consumer_url:
+        # NOTE(jamielennox): In the initial SAML2 authn Request issued by a
+        # Service Provider there is a url called ``consumer url``. A trusted
+        # Identity Provider should issue identical url. If the URLs are not
+        # equal the federated authn process should be interrupted and the user
+        # should be warned.
+        if sp_response.consumer_url != idp_response.consumer_url:
             # send fault message to the SP, discard the response
-            session.post(sp_response_consumer_url, data=self.SOAP_FAULT,
+            session.post(sp_response.consumer_url,
+                         data=self.SOAP_FAULT,
                          headers=self.ECP_SP_SAML2_REQUEST_HEADERS,
                          authenticated=False)
 
@@ -148,125 +180,36 @@ class Saml2Token(base._BaseSAMLPlugin):
                    '%(identity_provider)s %(idp_consumer_url)s are not equal')
             msg = msg % {
                 'service_provider': self.federated_token_url,
-                'sp_consumer_url': sp_response_consumer_url,
+                'sp_consumer_url': sp_response.consumer_url,
                 'identity_provider': self.identity_provider,
-                'idp_consumer_url': idp_sp_response_consumer_url
+                'idp_consumer_url': idp_response.consumer_url
             }
 
             raise exceptions.AuthorizationFailure(msg)
 
-    def _send_service_provider_request(self, session):
-        """Initial HTTP GET request to the SAML2 protected endpoint.
+        return idp_response
 
-        It's crucial to include HTTP headers indicating that the client is
-        willing to take advantage of the ECP SAML2 extension and receive data
-        as the SOAP.
-        Unlike standard authentication methods in the OpenStack Identity,
-        the client accesses::
-        ``/v3/OS-FEDERATION/identity_providers/{identity_providers}/
-        protocols/{protocol}/auth``
-
-        After a successful HTTP call the HTTP response should include SAML2
-        authn request in the XML format.
-
-        If a HTTP response contains ``X-Subject-Token`` in the headers and
-        the response body is a valid JSON assume the user was already
-        authenticated and Keystone returned a valid unscoped token.
-        Return True indicating the user was already authenticated.
-
-        :param session: a session object to send out HTTP requests.
-        :type session: keystoneauth1.session.Session
-
-        """
-        sp_response = session.get(self.federated_token_url,
-                                  headers=self.ECP_SP_EMPTY_REQUEST_HEADERS,
-                                  authenticated=False)
-
-        if 'X-Subject-Token' in sp_response.headers:
-            self.authenticated_response = sp_response
-            return True
-
-        try:
-            self.saml2_authn_request = etree.XML(sp_response.content)
-        except etree.XMLSyntaxError as e:
-            msg = ('SAML2: Error parsing XML returned '
-                   'from Service Provider, reason: %s') % e
-            raise exceptions.AuthorizationFailure(msg)
-
-        relay_state = self.saml2_authn_request.xpath(
-            self.ECP_RELAY_STATE, namespaces=self.ECP_SAML2_NAMESPACES)
-        self.relay_state = self._first(relay_state)
-
-        sp_response_consumer_url = self.saml2_authn_request.xpath(
-            self.ECP_SERVICE_PROVIDER_CONSUMER_URL,
-            namespaces=self.ECP_SAML2_NAMESPACES)
-        self.sp_response_consumer_url = self._first(sp_response_consumer_url)
-        return False
-
-    def _send_idp_saml2_authn_request(self, session):
-        """Present modified SAML2 authn assertion from the Service Provider."""
-
-        self._prepare_idp_saml2_request(self.saml2_authn_request)
-        idp_saml2_authn_request = self.saml2_authn_request
-
-        # Currently HTTPBasicAuth method is hardcoded into the plugin
-        idp_response = session.post(
-            self.identity_provider_url,
-            headers={'Content-type': 'text/xml'},
-            data=etree.tostring(idp_saml2_authn_request),
-            requests_auth=(self.username, self.password),
-            authenticated=False, log=False)
-
-        try:
-            self.saml2_idp_authn_response = etree.XML(idp_response.content)
-        except etree.XMLSyntaxError as e:
-            msg = ('SAML2: Error parsing XML returned '
-                   'from Identity Provider, reason: %s') % e
-            raise exceptions.AuthorizationFailure(msg)
-
-        idp_response_consumer_url = self.saml2_idp_authn_response.xpath(
-            self.ECP_IDP_CONSUMER_URL,
-            namespaces=self.ECP_SAML2_NAMESPACES)
-
-        self.idp_response_consumer_url = self._first(idp_response_consumer_url)
-
-        self._check_consumer_urls(session, self.idp_response_consumer_url,
-                                  self.sp_response_consumer_url)
-
-    def _send_service_provider_saml2_authn_response(self, session):
-        """Present SAML2 assertion to the Service Provider.
-
-        The assertion is issued by a trusted Identity Provider for the
-        authenticated user. This function directs the HTTP request to SP
-        managed URL, for instance: ``https://<host>:<port>/Shibboleth.sso/
-        SAML2/ECP``.
-        Upon success the there's a session created and access to the protected
-        resource is granted. Many implementations of the SP return HTTP 302
-        status code pointing to the protected URL (``https://<host>:<port>/v3/
-        OS-FEDERATION/identity_providers/{identity_provider}/protocols/
-        {protocol_id}/auth`` in this case). Saml2 plugin should point to that
-        URL again, with HTTP GET method, expecting an unscoped token.
-
-        :param session: a session object to send out HTTP requests.
-
-        """
-        self.saml2_idp_authn_response[0][0] = self.relay_state
+    def _post_sp(self, session, sp_response, idp_response):
+        idp_response.relay_state = sp_response.relay_state
 
         response = session.post(
-            self.idp_response_consumer_url,
+            idp_response.consumer_url,
             headers=self.ECP_SP_SAML2_REQUEST_HEADERS,
-            data=etree.tostring(self.saml2_idp_authn_response),
-            authenticated=False, redirect=False)
+            data=idp_response.to_string(),
+            authenticated=False,
+            redirect=False)
 
         # Don't follow HTTP specs - after the HTTP 302/303 response don't
         # repeat the call directed to the Location URL. In this case, this is
         # an indication that saml2 session is now active and protected resource
         # can be accessed.
-        response = self._handle_http_ecp_redirect(
-            session, response, method='GET',
-            headers=self.ECP_SP_SAML2_REQUEST_HEADERS)
+        if response.status_code not in (self.HTTP_MOVED_TEMPORARILY,
+                                        self.HTTP_SEE_OTHER):
+            return response
 
-        self.authenticated_response = response
+        return session.get(response.headers['location'],
+                           authenticated=False,
+                           headers=self.ECP_SP_SAML2_REQUEST_HEADERS)
 
     def get_unscoped_auth_ref(self, session):
         """Get unscoped OpenStack token after federated authentication.
@@ -334,9 +277,27 @@ class Saml2Token(base._BaseSAMLPlugin):
         :returns: AccessInfo
         :rtype: :py:class:`keystoneauth1.access.AccessInfo`
         """
-        saml_authenticated = self._send_service_provider_request(session)
-        if not saml_authenticated:
-            self._send_idp_saml2_authn_request(session)
-            self._send_service_provider_saml2_authn_response(session)
+        response = session.get(self.federated_token_url,
+                               headers=self.ECP_SP_EMPTY_REQUEST_HEADERS,
+                               authenticated=False)
 
-        return access.create(resp=self.authenticated_response)
+        # This may happen if you are already logged in
+        if 'X-Subject-Token' in response.headers:
+            return access.create(resp=response)
+
+        try:
+            sp_response = _SPResponse(response.content)
+        except etree.XMLSyntaxError as e:
+            msg = ('SAML2: Error parsing XML returned '
+                   'from Service Provider, reason: %s') % e
+            raise exceptions.AuthorizationFailure(msg)
+
+        try:
+            idp_response = self._post_idp(session, sp_response)
+        except etree.XMLSyntaxError as e:
+            msg = ('SAML2: Error parsing XML returned '
+                   'from Identity Provider, reason: %s') % e
+            raise exceptions.AuthorizationFailure(msg)
+
+        response = self._post_sp(session, sp_response, idp_response)
+        return access.create(resp=response)
