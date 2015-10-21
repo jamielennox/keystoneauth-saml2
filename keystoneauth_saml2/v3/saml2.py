@@ -15,6 +15,7 @@ import logging
 from keystoneauth1 import access
 from keystoneauth1 import exceptions
 from lxml import etree
+from requests import auth
 
 from keystoneauth_saml2.v3 import base
 
@@ -75,6 +76,95 @@ class _IDPResponse(_Response):
     @relay_state.setter
     def relay_state(self, value):
         self.data[0][0] = value
+
+
+class _ECPPassword(auth.AuthBase):
+
+    PAOS_MIME_TYPE = 'application/vnd.paos+xml'
+    PAOS_VERSION_TYPE = ('ver="urn:liberty:paos:2003-08";"urn:oasis:names:tc:'
+                         'SAML:2.0:profiles:SSO:ecp"')
+
+    def __init__(self, sp_url, idp_url, username, password):
+        self.sp_url = sp_url
+        self.idp_url = idp_url
+        self.username = username
+        self.password = password
+
+    def _handle_401(self, response, **kwargs):
+        if response.status_code != 401:
+            return response
+
+        try:
+            sp_response = _SPResponse(response.content)
+        except etree.XMLSyntaxError as e:
+            msg = ('SAML2: Error parsing XML returned '
+                   'from Service Provider, reason: %s') % e
+            raise exceptions.AuthorizationFailure(msg)
+
+        try:
+            idp_response = self._post_idp(session, sp_response)
+        except etree.XMLSyntaxError as e:
+            msg = ('SAML2: Error parsing XML returned '
+                   'from Identity Provider, reason: %s') % e
+            raise exceptions.AuthorizationFailure(msg)
+
+        return self._post_sp(session, sp_response, idp_response)
+
+    def _post_idp(self, session, sp_response):
+        """Present modified SAML2 authn assertion from the Service Provider."""
+        sp_response.prepare()
+
+        # Currently HTTPBasicAuth method is hardcoded into the plugin
+        response = session.post(
+            self.identity_provider_url,
+            headers={'Content-type': 'text/xml'},
+            data=sp_response.to_string(),
+            requests_auth=(self.username, self.password),
+            authenticated=False,
+            log=False)
+
+        idp_response = _IDPResponse(response.content)
+
+        # NOTE(jamielennox): In the initial SAML2 authn Request issued by a
+        # Service Provider there is a url called ``consumer url``. A trusted
+        # Identity Provider should issue identical url. If the URLs are not
+        # equal the federated authn process should be interrupted and the user
+        # should be warned.
+        if sp_response.consumer_url != idp_response.consumer_url:
+            # send fault message to the SP, discard the response
+            session.post(sp_response.consumer_url,
+                         data=self.SOAP_FAULT,
+                         headers=self.ECP_SP_SAML2_REQUEST_HEADERS,
+                         authenticated=False)
+
+            # prepare error message and raise an exception.
+            msg = ('Consumer URLs from Service Provider %(service_provider)s '
+                   '%(sp_consumer_url)s and Identity Provider '
+                   '%(identity_provider)s %(idp_consumer_url)s are not equal')
+            msg = msg % {
+                'service_provider': self.federated_token_url,
+                'sp_consumer_url': sp_response.consumer_url,
+                'identity_provider': self.identity_provider,
+                'idp_consumer_url': idp_response.consumer_url
+            }
+
+            raise exceptions.AuthorizationFailure(msg)
+
+        return idp_response
+
+    def __call__(self, request):
+        try:
+            accept = request.headers['accept']
+        except KeyError:
+            request.headers['accept'] = self.PAOS_MIME_TYPE
+        else:
+            if self.PAOS_MIME_TYPE not in accept:
+                accept = "%s, %s" % (accept, self.PAOS_MIME_TYPE)
+                request.headers['accept'] = accept
+
+        request.headers['PAOS'] = self.PAOS_VERSION_TYPE
+
+        request.register_hook('response', self._handle_401)
 
 
 class Saml2Token(base._BaseSAMLPlugin):
